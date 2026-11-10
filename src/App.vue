@@ -60,7 +60,7 @@ const busy = ref(false)
 const commandError = ref('')
 const theme = ref<Theme>('system')
 const showSettings = ref(false)
-const currentVersion = ref('0.2.1')
+const currentVersion = ref('0.2.2')
 const updateStatus = ref<'idle' | 'checking' | 'up-to-date' | 'available' | 'error'>('idle')
 const updateMessage = ref('尚未检查')
 const latestVersion = ref('')
@@ -442,7 +442,7 @@ onBeforeUnmount(() => {
 
     <div class="safety-note">
       <ShieldCheck :size="16" />
-      <span>免责声明：本软件仅通过受控 CPU 负载产生机身余热，不保证固定温度或暖手效果；真实暖手会消耗 CPU 与电量，可能影响性能。请保持通风，不要覆盖出风口，异常发热时立即停止。</span>
+      <span>免责声明：使用本软件的全部风险由使用者承担；作者不承担因使用本软件产生的任何责任。真实暖手会消耗 CPU 与电量，请保持通风，异常时立即停止。</span>
     </div>
 
     <transition name="slide">
@@ -450,7 +450,7 @@ onBeforeUnmount(() => {
         <div class="panel-heading compact"><span class="eyebrow">安全边界与外观</span><Power :size="16" /></div>
         <div class="setting-row"><span>真实 CPU 负载</span><strong>{{ desktopRuntimeAvailable ? '已接入' : '桌面端可用' }}</strong></div>
         <div class="setting-row"><span>电池保护</span><strong>{{ batteryPercent !== null && batteryPercent < 20 ? '低电量降载' : '自动保护' }}</strong></div>
-        <div class="disclaimer-box">安全与免责：请仅在设备通风良好、有人看护时使用。温度采样可能不可用，软件不能替代硬件温控。发现异常发热、异味、噪声或系统不稳定时，请立即停止并断开电源。对于设备、环境、供电、系统状态或使用不当导致的损害，作者在法律允许范围内不承担责任；本说明不排除法律规定不得排除的责任。</div>
+        <div class="disclaimer-box">安全与免责：本软件仅通过受控 CPU 负载产生机身余热，不是加热器，不保证固定温度、暖手效果或适配所有设备。使用者须自行承担使用或无法使用本软件的一切风险，包括但不限于 CPU 占用、功耗、风扇噪声、电池消耗、设备损坏、数据丢失、性能影响及人身伤害；作者不承担任何责任。请保持通风，不要覆盖出风口，并在有人看护时使用。温度采样可能不可用，软件不能替代硬件温控；发现异常发热、异味、噪声或系统不稳定时，请立即停止并断开电源。</div>
         <div class="setting-row"><span>界面主题</span><div class="theme-buttons"><button :class="{ selected: theme === 'system' }" title="跟随系统" @click="setTheme('system')"><Moon :size="13" /></button><button :class="{ selected: theme === 'light' }" title="浅色" @click="setTheme('light')"><Sun :size="13" /></button><button :class="{ selected: theme === 'dark' }" title="深色" @click="setTheme('dark')"><Zap :size="13" /></button></div></div>
         <div class="update-section">
           <div class="update-heading">
