@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for WarmDesk releases and sync them to the Lizi mirror
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=15min
+Persistent=true
+Unit=warmdesk-release-mirror.service
+
+[Install]
+WantedBy=timers.target

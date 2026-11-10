@@ -1,0 +1,19 @@
+[Unit]
+Description=Sync WarmDesk GitHub releases to the Lizi download mirror
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/warmdesk/release-mirror.env
+WorkingDirectory=/opt/warmdesk-release-mirror
+ExecStart=/opt/warmdesk-release-mirror/warmdesk-release-mirror-runner.sh --latest
+UMask=0022
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/1panel/www/sites/lizi/index/warmdesk/releases
+ReadWritePaths=/var/cache/warmdesk-release-mirror
+ReadWritePaths=/var/log/warmdesk-release-mirror

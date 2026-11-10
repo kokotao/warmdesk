@@ -1,0 +1,95 @@
+name: Sync Release To Lizi Mirror
+
+on:
+  workflow_run:
+    workflows:
+      - Release
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub Release tag, for example v0.1.0
+        required: true
+        type: string
+      dry_run:
+        description: Generate and validate the manifest without SSH/rsync upload
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: warmdesk-release-mirror
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Validate and sync release mirror
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      NOTE_MIRROR_HOST: ${{ secrets.WARM_DESK_MIRROR_HOST }}
+      NOTE_MIRROR_ROOT: ${{ secrets.WARM_DESK_MIRROR_ROOT }}
+      NOTE_MIRROR_BASE_URL: ${{ secrets.WARM_DESK_MIRROR_BASE_URL || 'https://note.lizipro.cn/warmdesk/releases' }}
+      RELEASE_TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+      RELEASE_DRY_RUN: ${{ inputs.dry_run || false }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.workflow_run.head_branch }}
+
+      - name: Install release mirror tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes jq rsync
+
+      - name: Validate release tag and mirror configuration
+        env:
+          MIRROR_KEY: ${{ secrets.WARM_DESK_MIRROR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]
+          [[ "$NOTE_MIRROR_BASE_URL" == https://* ]]
+          if [[ "$RELEASE_DRY_RUN" != "true" ]]; then
+            [[ -n "$NOTE_MIRROR_HOST" ]]
+            [[ -n "$NOTE_MIRROR_ROOT" ]]
+            [[ -n "$MIRROR_KEY" ]]
+          fi
+
+      - name: Configure SSH for mirror upload
+        if: env.RELEASE_DRY_RUN != 'true'
+        env:
+          MIRROR_KEY: ${{ secrets.WARM_DESK_MIRROR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$MIRROR_KEY" > "$HOME/.ssh/warmdesk_mirror_key"
+          chmod 600 "$HOME/.ssh/warmdesk_mirror_key"
+          printf '%s\n' \
+            'Host warmdesk-mirror' \
+            "  HostName ${NOTE_MIRROR_HOST#*@}" \
+            "  User ${NOTE_MIRROR_HOST%@*}" \
+            '  IdentityFile ~/.ssh/warmdesk_mirror_key' \
+            '  IdentitiesOnly yes' \
+            '  StrictHostKeyChecking accept-new' \
+            > "$HOME/.ssh/config"
+          echo "NOTE_MIRROR_HOST=warmdesk-mirror" >> "$GITHUB_ENV"
+
+      - name: Generate and optionally publish manifest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          args=(--tag "$RELEASE_TAG")
+          if [[ "$RELEASE_DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          bash scripts/release-mirror.sh "${args[@]}"
