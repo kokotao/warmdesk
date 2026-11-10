@@ -18,6 +18,7 @@ use std::{
 
 const MAX_INTENSITY: u8 = 60;
 const GENTLE_INTENSITY: u8 = 10;
+const AC_UNOBSERVED_MAX_INTENSITY: u8 = 35;
 const CYCLE_MS: u64 = 100;
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -51,6 +52,7 @@ pub struct WarmStatus {
     pub remaining_seconds: Option<u64>,
     pub cpu_usage_percent: Option<f32>,
     pub cpu_temperature_c: Option<f32>,
+    pub thermal_warning: Option<bool>,
     pub battery_percent: Option<u8>,
     pub on_ac_power: Option<bool>,
     pub locked: bool,
@@ -66,7 +68,7 @@ struct ControllerState {
 }
 
 struct WorkerHandles {
-    heat: JoinHandle<()>,
+    heat: Vec<JoinHandle<()>>,
 }
 
 pub struct HeatController {
@@ -136,7 +138,8 @@ impl HeatController {
         }
 
         self.stop_signal.store(false, Ordering::Release);
-        self.duty.store(GENTLE_INTENSITY, Ordering::Release);
+        // 监控首次采样完成前保持 0 duty，避免未知设备状态下提前制造负载。
+        self.duty.store(0, Ordering::Release);
         let duration =
             (duration_minutes > 0).then(|| Duration::from_secs(u64::from(duration_minutes) * 60));
         let started_at = Instant::now();
@@ -161,17 +164,37 @@ impl HeatController {
             );
         }
 
-        let stop_signal = Arc::clone(&self.stop_signal);
-        let duty = Arc::clone(&self.duty);
-        let worker = thread::Builder::new()
-            .name("warmdesk-heat-worker".to_string())
-            .spawn(move || run_worker(duty, stop_signal))
-            .map_err(|error| format!("暖手线程启动失败：{error}"))?;
+        let worker_count = heat_worker_count();
+        let mut workers = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let stop_signal = Arc::clone(&self.stop_signal);
+            let duty = Arc::clone(&self.duty);
+            match thread::Builder::new()
+                .name(format!("warmdesk-heat-worker-{index}"))
+                .spawn(move || run_worker(duty, stop_signal))
+            {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    self.stop_signal.store(true, Ordering::Release);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(format!("暖手线程启动失败：{error}"));
+                }
+            }
+        }
 
-        self.worker
-            .lock()
-            .map_err(|_| "暖手线程句柄不可用".to_string())?
-            .replace(WorkerHandles { heat: worker });
+        let mut worker_slot = match self.worker.lock() {
+            Ok(slot) => slot,
+            Err(_) => {
+                self.stop_signal.store(true, Ordering::Release);
+                for worker in workers {
+                    let _ = worker.join();
+                }
+                return Err("暖手线程句柄不可用".to_string());
+            }
+        };
+        worker_slot.replace(WorkerHandles { heat: workers });
         Ok(self.status())
     }
 
@@ -193,7 +216,9 @@ impl HeatController {
         self.duty.store(0, Ordering::Release);
         if let Ok(mut worker) = self.worker.lock() {
             if let Some(handles) = worker.take() {
-                let _ = handles.heat.join();
+                for handle in handles.heat {
+                    let _ = handle.join();
+                }
             }
         }
         if let Ok(mut state) = self.state.lock() {
@@ -211,14 +236,38 @@ impl Drop for HeatController {
         self.stop_signal.store(true, Ordering::Release);
         self.duty.store(0, Ordering::Release);
         if let Ok(monitor) = self.monitor.get_mut() {
-            drop(monitor.take());
+            if let Some(handle) = monitor.take() {
+                let _ = handle.join();
+            }
         }
         if let Ok(worker) = self.worker.get_mut() {
             if let Some(handles) = worker.take() {
-                let _ = handles.heat.join();
+                for handle in handles.heat {
+                    let _ = handle.join();
+                }
             }
         }
     }
+}
+
+fn heat_worker_count() -> usize {
+    logical_cpu_count().min(6)
+}
+
+fn logical_cpu_count() -> usize {
+    thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+}
+
+fn scale_worker_duty(target_duty: u8, logical_cpus: usize, worker_count: usize) -> u8 {
+    if target_duty == 0 || logical_cpus == 0 || worker_count == 0 {
+        return 0;
+    }
+    let numerator = u16::from(target_duty) * logical_cpus as u16;
+    let denominator = worker_count as u16;
+    let scaled = ((numerator + denominator - 1) / denominator).min(100);
+    scaled as u8
 }
 
 fn run_supervisor(
@@ -249,6 +298,7 @@ fn run_supervisor(
                 .map(|duration| duration.as_secs().saturating_sub(elapsed));
             state.status.cpu_usage_percent = snapshot.cpu_usage_percent;
             state.status.cpu_temperature_c = snapshot.cpu_temperature_c;
+            state.status.thermal_warning = snapshot.thermal_warning;
             state.status.battery_percent = snapshot.battery_percent;
             state.status.on_ac_power = snapshot.on_ac_power;
             state.status.locked = snapshot.locked;
@@ -272,18 +322,19 @@ fn run_supervisor(
                 state.started_at = None;
             } else if state.status.running {
                 let limits = evaluate_protection(&snapshot);
+                state.status.protection_reason = limits.pause_reason.clone();
+                let target_duty = calculate_duty(
+                    state.status.intensity,
+                    state.status.mode,
+                    SafetyLimits {
+                        max_intensity: limits.max_intensity,
+                        cpu_pressure: snapshot.cpu_usage_percent.unwrap_or_default().round() as u8,
+                        locked: snapshot.locked,
+                    },
+                    phase_seconds,
+                );
                 duty.store(
-                    calculate_duty(
-                        state.status.intensity,
-                        state.status.mode,
-                        SafetyLimits {
-                            max_intensity: limits.max_intensity,
-                            cpu_pressure: snapshot.cpu_usage_percent.unwrap_or_default().round()
-                                as u8,
-                            locked: snapshot.locked,
-                        },
-                        phase_seconds,
-                    ),
+                    scale_worker_duty(target_duty, logical_cpu_count(), heat_worker_count()),
                     Ordering::Release,
                 );
             } else {
@@ -331,6 +382,7 @@ fn sleep_while_active(duration: Duration, stop_signal: &AtomicBool) {
 struct Protection {
     max_intensity: u8,
     hard_stop: Option<String>,
+    pause_reason: Option<String>,
 }
 
 fn evaluate_protection(snapshot: &MonitorSnapshot) -> Protection {
@@ -341,6 +393,7 @@ fn evaluate_protection(snapshot: &MonitorSnapshot) -> Protection {
         return Protection {
             max_intensity: 0,
             hard_stop: Some("系统 CPU 已接近满载，暖手已暂停".to_string()),
+            pause_reason: None,
         };
     }
     if snapshot
@@ -350,12 +403,30 @@ fn evaluate_protection(snapshot: &MonitorSnapshot) -> Protection {
         return Protection {
             max_intensity: 0,
             hard_stop: Some("检测到 CPU 温度过高，暖手已暂停".to_string()),
+            pause_reason: None,
         };
     }
     if snapshot.battery_percent.is_some_and(|value| value < 10) {
         return Protection {
             max_intensity: 0,
             hard_stop: Some("电池电量低于 10%，暖手已暂停".to_string()),
+            pause_reason: None,
+        };
+    }
+
+    if snapshot.thermal_warning == Some(true) {
+        return Protection {
+            max_intensity: GENTLE_INTENSITY,
+            hard_stop: None,
+            pause_reason: Some("系统热状态告警，暖手已降载".to_string()),
+        };
+    }
+
+    if snapshot.locked {
+        return Protection {
+            max_intensity: 0,
+            hard_stop: None,
+            pause_reason: Some("设备已锁屏，暖手已暂停，解锁后自动恢复".to_string()),
         };
     }
 
@@ -367,20 +438,26 @@ fn evaluate_protection(snapshot: &MonitorSnapshot) -> Protection {
             .cpu_temperature_c
             .is_some_and(|value| value >= 75.0)
         || snapshot.battery_percent.is_some_and(|value| value < 20)
-        || snapshot.locked
-        || snapshot.cpu_temperature_c.is_none()
     {
         max_intensity = 25;
     }
-    if snapshot.cpu_usage_percent.is_none()
+
+    // AC 供电时，温度或锁屏采样不可用仍允许受控运行，但收紧到 35%。
+    // 非 AC 或电源状态未知时继续使用更保守的低限幅。
+    if snapshot.on_ac_power == Some(true)
+        && (snapshot.cpu_temperature_c.is_none() || !snapshot.lock_state_available)
+    {
+        max_intensity = max_intensity.min(AC_UNOBSERVED_MAX_INTENSITY);
+    } else if snapshot.cpu_usage_percent.is_none()
         || !snapshot.lock_state_available
-        || snapshot.on_ac_power.is_none()
+        || snapshot.on_ac_power != Some(true)
     {
         max_intensity = max_intensity.min(GENTLE_INTENSITY);
     }
     Protection {
         max_intensity,
         hard_stop: None,
+        pause_reason: None,
     }
 }
 
@@ -396,13 +473,13 @@ pub fn calculate_duty(
     if limits.cpu_pressure >= 95 {
         return 0;
     }
+    if limits.locked {
+        return 0;
+    }
     if limits.cpu_pressure >= 85 {
         duty = duty.min(GENTLE_INTENSITY);
     } else if limits.cpu_pressure >= 70 && mode == HeatMode::Adaptive {
         duty /= 2;
-    }
-    if limits.locked {
-        duty = duty.min(GENTLE_INTENSITY);
     }
     if mode == HeatMode::Pulse && phase_seconds % 10 >= 5 {
         return 0;
@@ -444,6 +521,7 @@ fn status_from_snapshot(
         remaining_seconds,
         cpu_usage_percent: snapshot.cpu_usage_percent,
         cpu_temperature_c: snapshot.cpu_temperature_c,
+        thermal_warning: snapshot.thermal_warning,
         battery_percent: snapshot.battery_percent,
         on_ac_power: snapshot.on_ac_power,
         locked: snapshot.locked,
@@ -455,7 +533,11 @@ fn status_from_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_duty, HeatMode, SafetyLimits};
+    use super::{
+        calculate_duty, evaluate_protection, scale_worker_duty, HeatMode, SafetyLimits,
+        AC_UNOBSERVED_MAX_INTENSITY, GENTLE_INTENSITY,
+    };
+    use crate::platform_monitor::MonitorSnapshot;
 
     #[test]
     fn clamps_requested_intensity_to_platform_limit() {
@@ -504,8 +586,61 @@ mod tests {
                 },
                 0
             ),
-            10
+            0
         );
+    }
+
+    #[test]
+    fn confirmed_lock_pauses_without_ending_session() {
+        let protection = evaluate_protection(&MonitorSnapshot {
+            locked: true,
+            lock_state_available: true,
+            on_ac_power: Some(true),
+            ..MonitorSnapshot::default()
+        });
+        assert_eq!(protection.max_intensity, 0);
+        assert!(protection.hard_stop.is_none());
+        assert!(protection.pause_reason.is_some());
+    }
+
+    #[test]
+    fn ac_power_allows_unobserved_temperature_and_lock_at_safe_cap() {
+        let protection = evaluate_protection(&MonitorSnapshot {
+            on_ac_power: Some(true),
+            lock_state_available: false,
+            cpu_usage_percent: Some(12.0),
+            ..MonitorSnapshot::default()
+        });
+        assert_eq!(protection.max_intensity, AC_UNOBSERVED_MAX_INTENSITY);
+        assert!(protection.pause_reason.is_none());
+    }
+
+    #[test]
+    fn unknown_power_keeps_conservative_budget_when_sampling_is_missing() {
+        let protection = evaluate_protection(&MonitorSnapshot::default());
+        assert_eq!(protection.max_intensity, GENTLE_INTENSITY);
+    }
+
+    #[test]
+    fn thermal_warning_reduces_budget_without_stopping_session() {
+        let protection = evaluate_protection(&MonitorSnapshot {
+            thermal_warning: Some(true),
+            on_ac_power: Some(true),
+            lock_state_available: true,
+            cpu_usage_percent: Some(20.0),
+            ..MonitorSnapshot::default()
+        });
+        assert_eq!(protection.max_intensity, GENTLE_INTENSITY);
+        assert!(protection.hard_stop.is_none());
+        assert!(protection.pause_reason.is_some());
+    }
+
+    #[test]
+    fn scales_target_duty_to_total_logical_cpu_budget() {
+        assert_eq!(scale_worker_duty(28, 10, 6), 47);
+        assert_eq!(scale_worker_duty(28, 4, 4), 28);
+        assert_eq!(scale_worker_duty(60, 10, 6), 100);
+        assert_eq!(scale_worker_duty(0, 10, 6), 0);
     }
 
     #[test]

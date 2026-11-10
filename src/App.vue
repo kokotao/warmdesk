@@ -31,6 +31,7 @@ interface WarmStatus {
   remaining_seconds: number | null
   cpu_usage_percent: number | null
   cpu_temperature_c: number | null
+  thermal_warning: boolean | null
   battery_percent: number | null
   on_ac_power: boolean | null
   locked: boolean
@@ -47,6 +48,7 @@ const elapsed = ref(0)
 const remaining = ref<number | null>(null)
 const cpuUsage = ref<number | null>(null)
 const cpuTemperature = ref<number | null>(null)
+const thermalWarning = ref<boolean | null>(null)
 const batteryPercent = ref<number | null>(null)
 const onAcPower = ref<boolean | null>(null)
 const locked = ref(false)
@@ -58,7 +60,7 @@ const busy = ref(false)
 const commandError = ref('')
 const theme = ref<Theme>('system')
 const showSettings = ref(false)
-const currentVersion = ref('0.2.0')
+const currentVersion = ref('0.2.1')
 const updateStatus = ref<'idle' | 'checking' | 'up-to-date' | 'available' | 'error'>('idle')
 const updateMessage = ref('尚未检查')
 const latestVersion = ref('')
@@ -127,6 +129,8 @@ const safetyMessage = computed(() => {
 })
 
 const displayTemperature = computed(() => cpuTemperature.value === null ? '--' : `${cpuTemperature.value.toFixed(0)}°`)
+const temperatureCaption = computed(() => cpuTemperature.value === null ? 'CPU 温度不可用' : 'CPU 温度采样')
+const thermalLabel = computed(() => thermalWarning.value === null ? '未知' : thermalWarning.value ? '告警' : '正常')
 const displayCpu = computed(() => cpuUsage.value === null ? '--' : `${cpuUsage.value.toFixed(0)}%`)
 const displayBattery = computed(() => batteryPercent.value === null ? '--' : `${batteryPercent.value.toFixed(0)}%`)
 const powerLabel = computed(() => {
@@ -142,6 +146,7 @@ function applyStatus(status: WarmStatus) {
   remaining.value = status.remaining_seconds
   cpuUsage.value = status.cpu_usage_percent
   cpuTemperature.value = status.cpu_temperature_c
+  thermalWarning.value = status.thermal_warning
   batteryPercent.value = status.battery_percent
   onAcPower.value = status.on_ac_power
   locked.value = status.locked
@@ -365,13 +370,13 @@ onBeforeUnmount(() => {
       <div class="readout-row">
         <div class="temperature-wrap">
           <span class="temperature">{{ displayTemperature }}</span>
-          <span class="temperature-caption">CPU 温度采样</span>
+          <span class="temperature-caption">{{ temperatureCaption }}</span>
         </div>
         <div class="heat-ring" :style="{ '--heat': `${Math.max(6, intensity)}%` }">
           <div class="heat-core"><Thermometer :size="23" /></div>
         </div>
       </div>
-      <p class="hero-copy">暖手强度是 CPU 时间预算，不是目标温度；实际热感取决于机型与环境。</p>
+      <p class="hero-copy">暖手强度是受控 CPU 时间预算，不是目标温度；实际热感取决于机型与环境。</p>
     </section>
 
     <div class="notice-strip" :class="{ warning: !desktopRuntimeAvailable || protectionReason }">
@@ -384,6 +389,7 @@ onBeforeUnmount(() => {
       <div class="telemetry-card"><Thermometer :size="15" /><span>温度</span><strong>{{ displayTemperature }}</strong></div>
       <div class="telemetry-card"><BatteryCharging :size="15" /><span>电源</span><strong>{{ powerLabel }}</strong></div>
       <div class="telemetry-card"><LockKeyhole :size="15" /><span>锁屏</span><strong>{{ lockStateAvailable ? locked ? '已锁屏' : '未锁屏' : '不可读取' }}</strong></div>
+      <div class="telemetry-card"><ShieldCheck :size="15" /><span>热状态</span><strong>{{ thermalLabel }}</strong></div>
     </section>
 
     <section class="panel controls">
@@ -396,7 +402,7 @@ onBeforeUnmount(() => {
       </div>
       <input v-model.number="intensity" class="range" type="range" min="5" max="60" step="1" aria-label="暖手强度" @change="updateWarmSettings({ intensity })" />
       <div class="range-labels"><span>5% · 柔和</span><span>20%</span><span>40%</span><span>60% · 建议上限</span></div>
-      <p class="helper">强度是单线程 CPU 时间片预算，不等同于整机占用。系统高负载、温度过高、电量过低或锁屏时会自动降载。</p>
+      <p class="helper">强度按整机逻辑 CPU 总容量换算，不同核心数的电脑会保持接近的整体占用。系统高负载、温度过高、电量过低或锁屏时会自动降载。</p>
     </section>
 
     <section class="panel mode-panel">
@@ -436,7 +442,7 @@ onBeforeUnmount(() => {
 
     <div class="safety-note">
       <ShieldCheck :size="16" />
-      <span>真实暖手会消耗 CPU 与电量，可能影响性能；请保持通风，不要覆盖出风口。</span>
+      <span>免责声明：本软件仅通过受控 CPU 负载产生机身余热，不保证固定温度或暖手效果；真实暖手会消耗 CPU 与电量，可能影响性能。请保持通风，不要覆盖出风口，异常发热时立即停止。</span>
     </div>
 
     <transition name="slide">
@@ -444,6 +450,7 @@ onBeforeUnmount(() => {
         <div class="panel-heading compact"><span class="eyebrow">安全边界与外观</span><Power :size="16" /></div>
         <div class="setting-row"><span>真实 CPU 负载</span><strong>{{ desktopRuntimeAvailable ? '已接入' : '桌面端可用' }}</strong></div>
         <div class="setting-row"><span>电池保护</span><strong>{{ batteryPercent !== null && batteryPercent < 20 ? '低电量降载' : '自动保护' }}</strong></div>
+        <div class="disclaimer-box">安全与免责：请仅在设备通风良好、有人看护时使用。温度采样可能不可用，软件不能替代硬件温控。发现异常发热、异味、噪声或系统不稳定时，请立即停止并断开电源。对于设备、环境、供电、系统状态或使用不当导致的损害，作者在法律允许范围内不承担责任；本说明不排除法律规定不得排除的责任。</div>
         <div class="setting-row"><span>界面主题</span><div class="theme-buttons"><button :class="{ selected: theme === 'system' }" title="跟随系统" @click="setTheme('system')"><Moon :size="13" /></button><button :class="{ selected: theme === 'light' }" title="浅色" @click="setTheme('light')"><Sun :size="13" /></button><button :class="{ selected: theme === 'dark' }" title="深色" @click="setTheme('dark')"><Zap :size="13" /></button></div></div>
         <div class="update-section">
           <div class="update-heading">

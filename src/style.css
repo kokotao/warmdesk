@@ -111,8 +111,9 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 .notice-strip svg { flex: 0 0 auto; margin-top: 1px; color: #47765f; }
 .notice-strip.warning { border-color: #e4c5b6; background: #f8ece6; color: #834a35; }
 .notice-strip.warning svg { color: #b46241; }
+.disclaimer-box { margin: 10px 0; padding: 10px 11px; border: 1px solid #e4c5b6; border-radius: 6px; color: #6e4b3d; background: #f8ece6; font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
 
-.telemetry-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 0 0 9px; }
+.telemetry-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 0 0 9px; }
 .telemetry-card {
   display: grid;
   min-height: 72px;
@@ -253,6 +254,8 @@ button:focus-visible, select:focus-visible, input:focus-visible {
   background: #1d2422;
 }
 :root[data-theme="dark"] body { background: #1d2422; }
+:root[data-theme="dark"] .disclaimer-box { border-color: #684b3f; color: #e5c7b8; background: #342923; }
+:root[data-theme="dark"] .safety-note { color: #bdc9c3; }
 :root[data-theme="dark"] .brand span,
 :root[data-theme="dark"] .temperature-caption,
 :root[data-theme="dark"] .hero-copy,

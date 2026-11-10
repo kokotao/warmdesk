@@ -1,6 +1,6 @@
 [package]
 name = "warmdesk"
-version = "0.2.0"
+version = "0.2.1"
 description = "WarmDesk low-impact desktop warm hand companion"
 authors = ["Albert_Luo"]
 edition = "2021"

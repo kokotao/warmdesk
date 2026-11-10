@@ -18,6 +18,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct MonitorSnapshot {
     pub cpu_usage_percent: Option<f32>,
     pub cpu_temperature_c: Option<f32>,
+    pub thermal_warning: Option<bool>,
     pub battery_percent: Option<u8>,
     pub on_ac_power: Option<bool>,
     pub locked: bool,
@@ -38,6 +39,12 @@ pub fn sample() -> MonitorSnapshot {
     let (temperature, temperature_note) = sample_cpu_temperature();
     snapshot.cpu_temperature_c = temperature;
     if let Some(note) = temperature_note {
+        notes.push(note);
+    }
+
+    let (thermal_warning, thermal_note) = sample_thermal_state();
+    snapshot.thermal_warning = thermal_warning;
+    if let Some(note) = thermal_note {
         notes.push(note);
     }
 
@@ -182,6 +189,22 @@ fn parse_temperature_c(text: &str) -> Option<f32> {
     (value.is_finite() && (0.0..=120.0).contains(&value)).then_some(value)
 }
 
+fn parse_macos_thermal_warning(text: &str) -> Option<bool> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("no thermal warning")
+        && (lower.contains("no performance warning") || !lower.contains("performance warning"))
+    {
+        return Some(false);
+    }
+    if lower.contains("thermal warning")
+        || lower.contains("cpu speed limit")
+        || lower.contains("performance warning")
+    {
+        return Some(true);
+    }
+    None
+}
+
 fn parse_macos_lock_state(text: &str) -> Option<bool> {
     if text.contains("CGSSessionScreenIsLocked = 1") {
         Some(true)
@@ -231,6 +254,28 @@ fn sample_cpu_temperature() -> (Option<f32>, Option<String>) {
         None,
         Some("macOS 未提供稳定的公开 CPU 温度接口，已采用保守强度上限".to_string()),
     )
+}
+
+#[cfg(target_os = "macos")]
+fn sample_thermal_state() -> (Option<bool>, Option<String>) {
+    match run_command("pmset", &["-g", "therm"]) {
+        Ok(output) => match parse_macos_thermal_warning(&output) {
+            Some(true) => (Some(true), Some("系统热状态告警，暖手已降载".to_string())),
+            Some(false) => (Some(false), None),
+            None => (None, Some("系统热状态采样格式不可识别".to_string())),
+        },
+        Err(error) => (None, Some(format!("系统热状态采样不可用：{error}"))),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn sample_thermal_state() -> (Option<bool>, Option<String>) {
+    (None, None)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn sample_thermal_state() -> (Option<bool>, Option<String>) {
+    (None, Some("当前平台暂未提供系统热状态采样".to_string()))
 }
 
 #[cfg(target_os = "windows")]
@@ -376,8 +421,9 @@ fn sample_lock_state() -> (bool, bool, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_cpu_percent, parse_macos_battery, parse_macos_lock_state, parse_macos_top_cpu,
-        parse_temperature_c, parse_windows_battery, parse_windows_lock_state,
+        parse_cpu_percent, parse_macos_battery, parse_macos_lock_state,
+        parse_macos_thermal_warning, parse_macos_top_cpu, parse_temperature_c,
+        parse_windows_battery, parse_windows_lock_state,
     };
 
     #[test]
@@ -423,6 +469,22 @@ mod tests {
     fn rejects_unrealistic_temperature() {
         assert_eq!(parse_temperature_c("Temperature: 54.2"), Some(54.2));
         assert_eq!(parse_temperature_c("Temperature: 140"), None);
+    }
+
+    #[test]
+    fn parses_macos_thermal_warning() {
+        assert_eq!(
+            parse_macos_thermal_warning(
+                "Note: No thermal warning level has been recorded\n\
+                 Note: No performance warning level has been recorded"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            parse_macos_thermal_warning("CPU Speed Limit = 80"),
+            Some(true)
+        );
+        assert_eq!(parse_macos_thermal_warning(""), None);
     }
 
     #[test]
