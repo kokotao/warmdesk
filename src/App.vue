@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import {
   Activity,
   BatteryCharging,
@@ -68,9 +69,21 @@ const releaseUrl = ref('https://github.com/kokotao/warmdesk/releases/latest')
 const releaseApiUrl = ref('https://api.github.com/repos/kokotao/warmdesk/releases/latest')
 const mirrorManifestUrl = ref('https://note.lizipro.cn/warmdesk/releases/latest.json')
 const downloadSource = ref<'mirror' | 'github'>('github')
+const platformOs = ref('')
+const platformArch = ref('')
+const downloadState = ref<'idle' | 'downloading' | 'completed' | 'error'>('idle')
+const downloadProgress = ref(0)
+const downloadMessage = ref('')
+const selectedAsset = ref<{
+  name: string
+  url: string
+  size?: number
+  sha256?: string
+} | null>(null)
 let tick: number | undefined
 let statusPoll: number | undefined
 let colorScheme: MediaQueryList | undefined
+let unlistenDownload: (() => void) | undefined
 
 const modeLabel = computed(() => ({
   steady: '恒温',
@@ -87,18 +100,41 @@ function isHttpsUrl(value: string | undefined): value is string {
   }
 }
 
-function selectAsset<T extends { name?: string; urls?: { note?: string; github?: string }; browser_download_url?: string }>(
+function selectAsset<T extends {
+  name?: string
+  size?: number
+  sha256?: string
+  digest?: string
+  urls?: { note?: string; github?: string }
+  browser_download_url?: string
+}>(
   assets: T[] | undefined,
-  isMirrorAsset: boolean
+  isMirrorAsset: boolean,
+  os = platformOs.value,
+  arch = platformArch.value
 ) {
-  const windows = /windows/i.test(navigator.userAgent)
+  const windows = os === 'windows' || (!os && /windows/i.test(navigator.userAgent))
+  const arm64 = arch === 'aarch64' || arch === 'arm64'
   const candidates = assets?.filter((asset) => {
     const name = asset.name?.toLowerCase() || ''
-    return windows ? name.endsWith('.msi') || name.endsWith('.exe') : name.endsWith('.dmg')
+    const packageMatch = windows ? name.endsWith('.msi') || name.endsWith('.exe') : name.endsWith('.dmg')
+    const architectureMatch = windows
+      ? !arm64 || name.includes('arm64') || name.includes('aarch64')
+      : arm64 ? name.includes('aarch64') || name.includes('arm64') : name.includes('x64') || name.includes('x86_64')
+    return packageMatch && architectureMatch
   }) ?? []
-  const asset = candidates.find((item) => item.name?.toLowerCase().endsWith(windows ? '.msi' : '.dmg')) ?? candidates[0]
+  const asset = candidates.find((item) => {
+    const name = item.name?.toLowerCase() || ''
+    return windows ? name.endsWith('.msi') : name.endsWith('.dmg')
+  }) ?? candidates[0]
   const url = isMirrorAsset ? asset?.urls?.note : asset?.browser_download_url
-  return isHttpsUrl(url) ? url : ''
+  if (!asset?.name || !isHttpsUrl(url)) return null
+  return {
+    name: asset.name,
+    url,
+    size: asset.size,
+    sha256: asset.sha256 || asset.digest?.replace(/^sha256:/, '')
+  }
 }
 
 const elapsedLabel = computed(() => {
@@ -253,11 +289,15 @@ async function loadUpdateInfo() {
   try {
     const info = await invoke<{
       current_version: string
+      os?: string
+      arch?: string
       mirror_manifest_url: string
       release_api_url: string
       release_page_url: string
     }>('get_update_info')
     currentVersion.value = info.current_version
+    platformOs.value = info.os || ''
+    platformArch.value = info.arch || ''
     mirrorManifestUrl.value = info.mirror_manifest_url
     releaseApiUrl.value = info.release_api_url
     releaseUrl.value = info.release_page_url
@@ -269,12 +309,19 @@ async function loadUpdateInfo() {
 async function checkForUpdates() {
   updateStatus.value = 'checking'
   updateMessage.value = '正在检查栗子镜像…'
+  downloadState.value = 'idle'
+  downloadProgress.value = 0
+  downloadMessage.value = ''
   try {
     let releaseVersion = ''
     let resolvedReleaseUrl = releaseUrl.value
     let resolvedDownloadUrl = ''
     try {
-      const mirrorResponse = await fetch(mirrorManifestUrl.value, { headers: { Accept: 'application/json' } })
+      const mirrorUrl = `${mirrorManifestUrl.value}?warmdesk_check=${Date.now()}`
+      const mirrorResponse = await fetch(mirrorUrl, {
+        cache: 'no-store',
+        headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' }
+      })
       if (!mirrorResponse.ok) throw new Error(`HTTP ${mirrorResponse.status}`)
       const manifest = await mirrorResponse.json() as {
         version?: string
@@ -282,20 +329,20 @@ async function checkForUpdates() {
         release_url?: string
         assets?: Array<{
           name?: string
+          size?: number
+          sha256?: string
           urls?: { note?: string; github?: string }
         }>
       }
       if (!manifest.version || !Array.isArray(manifest.assets)) throw new Error('镜像 manifest 无效')
       releaseVersion = manifest.tag || manifest.version
       resolvedReleaseUrl = manifest.release_url || resolvedReleaseUrl
-      resolvedDownloadUrl = selectAsset(manifest.assets, true)
-      if (!resolvedDownloadUrl) {
-        const githubAsset = manifest.assets.find((asset) => isHttpsUrl(asset.urls?.github))
-        resolvedDownloadUrl = githubAsset?.urls?.github || ''
-      }
-      downloadSource.value = resolvedDownloadUrl && manifest.assets.some((asset) => asset.urls?.note === resolvedDownloadUrl)
-        ? 'mirror'
-        : 'github'
+      const mirrorAsset = selectAsset(manifest.assets, true)
+      const githubAsset = selectAsset(manifest.assets, false)
+      const asset = mirrorAsset || githubAsset
+      selectedAsset.value = asset
+      resolvedDownloadUrl = asset?.url || ''
+      downloadSource.value = mirrorAsset ? 'mirror' : 'github'
     } catch {
       const response = await fetch(releaseApiUrl.value, {
         headers: { Accept: 'application/vnd.github+json' }
@@ -304,14 +351,16 @@ async function checkForUpdates() {
       const release = await response.json() as {
         tag_name?: string
         html_url?: string
-        assets?: Array<{ browser_download_url?: string; name?: string }>
+        assets?: Array<{ browser_download_url?: string; name?: string; size?: number; digest?: string }>
         prerelease?: boolean
         draft?: boolean
       }
       if (!release.tag_name || release.draft || release.prerelease) throw new Error('暂无稳定版本')
       releaseVersion = release.tag_name
       resolvedReleaseUrl = release.html_url || resolvedReleaseUrl
-      resolvedDownloadUrl = selectAsset(release.assets, false)
+      const asset = selectAsset(release.assets, false)
+      selectedAsset.value = asset
+      resolvedDownloadUrl = asset?.url || ''
       downloadSource.value = 'github'
     }
 
@@ -325,8 +374,33 @@ async function checkForUpdates() {
       updateMessage.value = `当前已是最新版本（${currentVersion.value}）· ${downloadSource.value === 'mirror' ? '栗子镜像' : 'GitHub'}`
     }
   } catch {
+    selectedAsset.value = null
     updateStatus.value = 'error'
     updateMessage.value = '检查失败，请稍后重试或打开 GitHub Release 页面'
+  }
+}
+
+async function downloadUpdate() {
+  if (downloadState.value === 'downloading' || !selectedAsset.value) {
+    if (!selectedAsset.value && isHttpsUrl(releaseUrl.value)) window.open(releaseUrl.value, '_blank', 'noopener,noreferrer')
+    return
+  }
+  downloadState.value = 'downloading'
+  downloadProgress.value = 0
+  downloadMessage.value = '正在准备下载…'
+  try {
+    const path = await invoke<string>('download_update', {
+      url: selectedAsset.value.url,
+      filename: selectedAsset.value.name,
+      expectedSize: selectedAsset.value.size ?? null,
+      expectedSha256: selectedAsset.value.sha256 ?? null
+    })
+    downloadState.value = 'completed'
+    downloadProgress.value = 100
+    downloadMessage.value = `下载完成：${path}`
+  } catch (error) {
+    downloadState.value = 'error'
+    downloadMessage.value = error instanceof Error ? error.message : '下载失败，请稍后重试。'
   }
 }
 
@@ -338,11 +412,27 @@ onMounted(async () => {
   colorScheme = window.matchMedia('(prefers-color-scheme: dark)')
   colorScheme.addEventListener('change', applyTheme)
   applyTheme()
+  try {
+    unlistenDownload = await listen<{
+      downloaded_bytes: number
+      total_bytes?: number
+      percent?: number
+    }>('download-progress', (event) => {
+      const percent = event.payload.percent
+      if (typeof percent === 'number') downloadProgress.value = percent
+      if (event.payload.total_bytes) {
+        downloadMessage.value = `已下载 ${(event.payload.downloaded_bytes / 1024 / 1024).toFixed(1)} / ${(event.payload.total_bytes / 1024 / 1024).toFixed(1)} MB`
+      }
+    })
+  } catch {
+    // Browser preview does not have the Tauri event bridge.
+  }
   await Promise.all([loadUpdateInfo(), refreshStatus()])
   statusPoll = window.setInterval(refreshStatus, 2000)
 })
 onBeforeUnmount(() => {
   clearTimer()
+  unlistenDownload?.()
   colorScheme?.removeEventListener('change', applyTheme)
 })
 </script>
@@ -461,14 +551,25 @@ onBeforeUnmount(() => {
             <RefreshCw :size="15" :class="{ spinning: updateStatus === 'checking' }" />
           </div>
           <p class="update-message" :class="`is-${updateStatus}`">{{ updateMessage }}</p>
+          <div v-if="downloadState === 'downloading' || downloadState === 'completed' || downloadState === 'error'" class="download-status">
+            <div class="download-status-row">
+              <span>{{ downloadState === 'downloading' ? '下载进度' : downloadState === 'completed' ? '下载完成' : '下载失败' }}</span>
+              <strong v-if="downloadState !== 'error'">{{ downloadProgress }}%</strong>
+            </div>
+            <div v-if="downloadState !== 'error'" class="download-progress" role="progressbar" :aria-valuenow="downloadProgress" aria-valuemin="0" aria-valuemax="100">
+              <span :style="{ width: `${downloadProgress}%` }"></span>
+            </div>
+            <p class="download-detail">{{ downloadMessage }}</p>
+          </div>
           <div class="update-actions">
             <button class="update-button" :disabled="updateStatus === 'checking'" @click="checkForUpdates">
               <RefreshCw :size="13" /> 检查更新
             </button>
-            <a class="release-link" :href="releaseUrl" target="_blank" rel="noreferrer">
-              {{ updateStatus === 'available' && latestVersion ? `下载 ${latestVersion}` : '打开 Release' }}
-              <ExternalLink :size="12" />
-            </a>
+            <button class="release-link" :disabled="downloadState === 'downloading'" @click="downloadUpdate">
+              <RefreshCw v-if="downloadState === 'downloading'" :size="12" class="spinning" />
+              <ExternalLink v-else :size="12" />
+              {{ downloadState === 'downloading' ? `下载中 ${downloadProgress}%` : updateStatus === 'available' && latestVersion ? `下载 ${latestVersion}` : '打开 Release' }}
+            </button>
           </div>
         </div>
       </section>

@@ -31,12 +31,21 @@ REPO="${GITHUB_REPOSITORY:-kokotao/warmdesk}"
 NOTE_BASE_URL="${NOTE_MIRROR_BASE_URL:-https://note.lizipro.cn/warmdesk/releases}"
 NOTE_ROOT="${NOTE_MIRROR_ROOT:-}"
 NOTE_HOST="${NOTE_MIRROR_HOST:-}"
+CURL_RETRY_COUNT="${WARM_DESK_CURL_RETRY_COUNT:-6}"
+CURL_RETRY_DELAY="${WARM_DESK_CURL_RETRY_DELAY:-5}"
+CURL_CONNECT_TIMEOUT="${WARM_DESK_CURL_CONNECT_TIMEOUT:-20}"
+CURL_MAX_TIME="${WARM_DESK_CURL_MAX_TIME:-300}"
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
 if [[ "$NOTE_BASE_URL" != https://* || "$NOTE_BASE_URL" == *[[:space:]]* ]]; then
   echo "NOTE_MIRROR_BASE_URL must be an HTTPS URL without whitespace" >&2
   exit 2
 fi
+[[ "$CURL_RETRY_COUNT" =~ ^[0-9]+$ && "$CURL_RETRY_DELAY" =~ ^[0-9]+$ &&
+  "$CURL_CONNECT_TIMEOUT" =~ ^[0-9]+$ && "$CURL_MAX_TIME" =~ ^[0-9]+$ ]] || {
+  echo "WarmDesk curl retry and timeout settings must be non-negative integers" >&2
+  exit 2
+}
 
 sha256_file() {
   if command -v sha256sum >/dev/null; then
@@ -52,7 +61,11 @@ require_publish_tools() {
 }
 
 if ((LATEST)); then
-  release_json="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")"
+  release_json="$(curl -fsSL \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+    --retry "$CURL_RETRY_COUNT" --retry-all-errors --retry-delay "$CURL_RETRY_DELAY" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${REPO}/releases/latest")"
   TAG="$(jq -r '.tag_name // empty' <<<"$release_json")"
 fi
 [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || {
@@ -61,7 +74,13 @@ fi
 }
 VERSION="${TAG#v}"
 if [[ -z "$ASSETS_DIR" ]]; then
-  mirror_json="$(curl -fsSL --max-time 20 "${NOTE_BASE_URL%/}/latest.json" 2>/dev/null || true)"
+  # The public mirror may set a long-lived immutable cache policy. Always use a
+  # unique query parameter so a newly published release is not hidden by CDN
+  # or proxy cache state.
+  mirror_cache_bust="$(date +%s%N)"
+  mirror_json="$(curl -fsSL --max-time 20 \
+    -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
+    "${NOTE_BASE_URL%/}/latest.json?warmdesk_check=${mirror_cache_bust}" 2>/dev/null || true)"
   if [[ -n "$mirror_json" ]] && jq -e --arg tag "$TAG" '.tag == $tag and (.assets | length > 0)' \
     >/dev/null 2>&1 <<<"$mirror_json"; then
     echo "MIRROR_UP_TO_DATE tag=${TAG}; skipping asset download"
@@ -80,6 +99,8 @@ if [[ -z "$ASSETS_DIR" ]]; then
       github_api_args+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
     fi
     release_json="$(curl "${github_api_args[@]}" \
+      --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+      --retry "$CURL_RETRY_COUNT" --retry-all-errors --retry-delay "$CURL_RETRY_DELAY" \
       "https://api.github.com/repos/${REPO}/releases/tags/${TAG}")"
   fi
   release_tag="$(jq -r '.tag_name // empty' <<<"$release_json")"
@@ -101,8 +122,9 @@ if [[ -z "$ASSETS_DIR" ]]; then
           exit 1
         }
         target="$ASSETS_DIR/$name"
-        curl -fL --connect-timeout 20 --max-time 300 \
-          --retry 4 --retry-all-errors --retry-delay 2 "$url" -o "$target.part"
+        curl -fL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+          --retry "$CURL_RETRY_COUNT" --retry-all-errors --retry-delay "$CURL_RETRY_DELAY" \
+          "$url" -o "$target.part"
         actual_size="$(wc -c < "$target.part" | tr -d ' ')"
         [[ "$expected_size" == "0" || "$actual_size" == "$expected_size" ]] || {
           echo "size mismatch for $name" >&2

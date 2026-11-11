@@ -231,6 +231,12 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 .update-button { border: 1px solid #cbd6d0; background: #fff; color: #44524d; }
 .update-button:disabled { cursor: wait; opacity: .6; }
 .release-link { border: 1px solid #d4a88f; background: #f6e9e0; color: #8c4b30; }
+.release-link:disabled { cursor: wait; opacity: .68; }
+.download-status { margin: 0 0 9px; padding: 7px 8px; border: 1px solid #d4a88f; border-radius: 5px; background: rgba(246, 233, 224, .48); color: #795340; }
+.download-status-row { display: flex; justify-content: space-between; gap: 8px; font-size: 10px; }
+.download-progress { height: 5px; margin-top: 6px; overflow: hidden; border-radius: 999px; background: #e4d8d0; }
+.download-progress span { display: block; height: 100%; border-radius: inherit; background: #c96f46; transition: width .2s ease; }
+.download-detail { margin: 5px 0 0; overflow-wrap: anywhere; font-size: 9px; line-height: 1.35; }
 .spinning { animation: spin .9s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .slide-enter-active, .slide-leave-active { transition: opacity .16s ease, transform .16s ease; }
@@ -290,3 +296,5 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 :root[data-theme="dark"] .update-heading strong { color: #e5ece8; }
 :root[data-theme="dark"] .setting-row + .setting-row,
 :root[data-theme="dark"] .update-section { border-color: #35423d; }
+:root[data-theme="dark"] .download-status { border-color: #976a50; background: rgba(117, 68, 47, .24); color: #e2b59c; }
+:root[data-theme="dark"] .download-progress { background: #493b34; }
